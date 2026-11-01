@@ -1,0 +1,73 @@
+services:
+  workspace:
+    # One image per Claude Code version, so batches with different versions can't swap each other's image
+    image: pilot-workspace:${CLAUDE_CODE_VERSION:-latest}
+    build:
+      context: ./agent
+      args:
+        CLAUDE_CODE_VERSION: ${CLAUDE_CODE_VERSION:-latest}
+    working_dir: /workspace/${APP_DIR:?}
+    volumes:
+      - workspace:/workspace
+    environment:
+      # Empty entries pass the host value through, or leave the variable unset if the host has none
+      ANTHROPIC_API_KEY:
+      ANTHROPIC_FOUNDRY_API_KEY:
+      ANTHROPIC_FOUNDRY_BASE_URL:
+      ANTHROPIC_CUSTOM_HEADERS:
+      CLAUDE_CODE_USE_FOUNDRY:
+      CLAUDE_CODE_SKIP_FOUNDRY_AUTH:
+      CLAUDE_CODE_DISABLE_EXPERIMENTAL_BETAS:
+      ANTHROPIC_DEFAULT_OPUS_MODEL:
+      ANTHROPIC_DEFAULT_SONNET_MODEL:
+      ANTHROPIC_DEFAULT_HAIKU_MODEL:
+      DISABLE_AUTOUPDATER: "1"
+      PORT: "3000"
+      DB_URL: ${DB_URL:?}
+      TEST_DB_URL: ${TEST_DB_URL:?}
+    ports:
+      - "${APP_PORT:-3000}:3000"
+    # Webhook checks run a receiver on the host (Docker Desktop has this name already; Linux needs it)
+    extra_hosts:
+      - "host.docker.internal:host-gateway"
+    command: ["sleep", "infinity"]
+    # tini as PID 1 passes on SIGTERM; a bare `sleep` ignores it, so every restart waited 10 s
+    init: true
+
+  postgres:
+    profiles: [postgres]
+    image: postgres:16
+    environment:
+      POSTGRES_USER: app
+      POSTGRES_PASSWORD: app
+      POSTGRES_DB: ${DB_NAME:?}
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+      - ./initdb.sql:/docker-entrypoint-initdb.d/init.sql:ro
+    networks:
+      default:
+        aliases: [db]
+
+  mongo:
+    profiles: [mongodb]
+    image: mongo:8
+    # Single-node replica set, as in production deployments: multi-document transactions need one
+    command: ["--replSet", "rs0", "--bind_ip_all"]
+    healthcheck:
+      # Initiates the replica set on first start; afterwards just reports its status
+      test: ["CMD", "mongosh", "--quiet", "--eval",
+             "try { rs.status().ok } catch (e) { rs.initiate({_id: 'rs0', members: [{_id: 0, host: 'db:27017'}]}).ok }"]
+      interval: 5s
+      timeout: 10s
+      start_period: 10s
+      retries: 30
+    volumes:
+      - mongodata:/data/db
+    networks:
+      default:
+        aliases: [db]
+
+volumes:
+  workspace: {}
+  pgdata: {}
+  mongodata: {}

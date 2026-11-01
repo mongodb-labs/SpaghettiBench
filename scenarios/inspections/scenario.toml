@@ -1,0 +1,326 @@
+# Field inspections: a form-builder backend whose customers' checklists keep changing shape.
+# Deploy messages look like ordinary deploys; the agent can read git history.
+
+[app]
+app_dir = "field-inspections"   # repo folder the agent sees: /workspace/<app_dir>
+db_name = "inspections"
+port = 3000                     # runs use port to port + 199
+
+[[phases]]
+name = "initial"
+kind = "feature"
+prompt = ["0_initial.md"]
+deploy = "Deploy 2026-09-30"
+summary = "Companies define flat checklists; submit, list and filter submissions by answers"
+favours = "neutral"
+mechanism = "baseline"
+why = "Seeded afterwards; the design chosen here (EAV, JSONB or documents) shapes every later phase."
+
+[[phases]]
+name = "repeating_groups"
+kind = "feature"
+prompt = ["1_repeating_groups.md", "constraints.md"]
+deploy = "Deploy 2026-10-14"
+summary = """\
+Repeating groups; filters where all conditions hold on the same group item; convert Acme's existing form \
+and submissions; keep accepting the old shape and old filter keys"""
+favours = "mongodb"
+mechanism = "schema-change"
+why = """\
+A cardinality change on live data: flat answers become a list of items. Same-item filters are $elemMatch \
+in MongoDB, but need jsonpath or child tables in Postgres."""
+
+[[phases]]
+name = "multi_level"
+kind = "feature"
+prompt = ["2_multi_level.md", "constraints.md"]
+deploy = "Deploy 2026-10-28"
+summary = """\
+Groups inside groups (4 levels); stable ids for every group item, backfilled on existing data; filters at \
+any depth; concurrent item appends"""
+favours = "mongodb"
+mechanism = "nested-update"
+why = """\
+Appending an item at a path is an atomic $push in MongoDB, but a read-modify-write of JSONB (or parent \
+pointers in child tables) in Postgres. A redeploy follows: item ids of existing submissions must not change."""
+
+[[phases]]
+name = "text_filters"
+kind = "improvement"
+prompt = ["3_text_filters.md", "constraints.md"]
+deploy = "Deploy 2026-11-11"
+summary = "Filters on text fields ignore case, at any depth and for Acme's old filter keys; other types unchanged"
+favours = "mongodb"
+mechanism = "text-matching"
+why = "Slightly: MongoDB compares case-insensitively with a collation or regex; Postgres needs lower() on JSONB paths at any depth."
+
+[[phases]]
+name = "form_versions"
+kind = "feature"
+prompt = ["4_form_versions.md", "constraints.md"]
+deploy = "Deploy 2026-11-25"
+summary = "Editing a form creates a version; submissions belong to a version, render and filter against their own version"
+favours = "neutral"
+mechanism = "schema-change"
+why = "Versioning with existing data; both store definitions as JSON. The checks edit one seeded form (the kitchen audit)."
+
+[[phases]]
+name = "advanced_search"
+kind = "feature"
+prompt = ["5_advanced_search.md", "constraints.md"]
+deploy = "Deploy 2026-12-09"
+summary = """\
+Range, list and substring operators on any path (same-item rule), submission-time filters, company-wide \
+search across forms"""
+favours = "mongodb"
+mechanism = "nested-query"
+why = "Query operators on nested arrays ($elemMatch with ranges) vs jsonpath or SQL generated per path."
+
+[[phases]]
+name = "offline_sync"
+kind = "feature"
+prompt = ["6_offline_sync.md", "constraints.md"]
+deploy = "Deploy 2026-12-23"
+summary = """\
+Late uploads against older form versions; safe retries with clientSubmissionId (also concurrent); batch \
+upload with per-entry results"""
+favours = "neutral"
+mechanism = "idempotency"
+why = "Unique indexes de-duplicate retries in both; late uploads reuse the versioning from form_versions."
+
+[[phases]]
+name = "compliance_reports"
+kind = "feature"
+prompt = ["7_compliance_reports.md", "constraints.md"]
+deploy = "Deploy 2027-01-06"
+summary = """\
+Counts and failure rates grouped by answer paths (incl. nested items), month and form; per form and \
+company-wide, across versions"""
+favours = "postgres"
+mechanism = "cross-entity-report"
+why = "The flip: aggregation across all data is GROUP BY with lateral joins in SQL vs aggregation pipelines with $unwind."
+
+[[phases]]
+name = "report_timezone"
+kind = "improvement"
+prompt = ["8_report_timezone.md", "constraints.md"]
+deploy = "Deploy 2027-01-20"
+summary = "Reports take ?timezone= for months, including daylight saving; default UTC; unknown zone 400"
+favours = "neutral"
+mechanism = "time-handling"
+why = "Both have time-zone-aware date functions (AT TIME ZONE, $dateToString with timezone)."
+
+# Phases 9-20 work on single items deep inside submissions, where JSONB (read the row, change it,
+# write it back) and documents (atomic updates at a path) differ most. Tidewater's nested data is
+# added after report_timezone (see seed_more).
+
+[[phases]]
+name = "item_api"
+kind = "feature"
+prompt = ["9_item_api.md", "constraints.md"]
+deploy = "Deploy 2027-02-03"
+summary = "GET, PATCH and DELETE single group items at any depth; concurrent edits of different items never lost"
+favours = "mongodb"
+mechanism = "nested-update"
+why = """\
+Changing one item at a path is a single atomic update with arrayFilters in MongoDB; with JSONB it is \
+read, change and write back the whole document, which loses concurrent edits without row locks."""
+
+[[phases]]
+name = "findings"
+kind = "feature"
+prompt = ["10_findings.md", "constraints.md"]
+deploy = "Deploy 2027-02-17"
+summary = """\
+Findings with comments on items at any depth; concurrent comments; backfill a finding for every failed \
+item of Tidewater's existing inspections"""
+favours = "mongodb"
+mechanism = "nested-update"
+why = """\
+Lists growing inside nested items ($push at a path) and a backfill across nested arrays of live data; \
+a Postgres design either rewrites JSONB documents or moves findings into their own table."""
+
+[[phases]]
+name = "findings_search"
+kind = "feature"
+prompt = ["11_findings_search.md", "constraints.md"]
+deploy = "Deploy 2027-03-03"
+summary = "Company-wide finding list across all submissions: filters, ordering by due date, cursor paging, the item's path"
+favours = "mongodb"
+mechanism = "nested-query"
+why = """\
+Unwinding findings out of nested items ($unwind) vs lateral jsonb_array_elements four levels deep, \
+or a restructure that moves findings into a table."""
+
+[[phases]]
+name = "users_and_roles"
+kind = "feature"
+prompt = ["12_users_and_roles.md", "constraints.md"]
+deploy = "Deploy 2027-03-17"
+summary = "Users with roles; X-User-Id on any request; company isolation and inspector restrictions on every endpoint"
+favours = "neutral"
+mechanism = "cross-cutting"
+why = "Touches every endpoint; grows the codebase without depending on the data model."
+
+[[phases]]
+name = "bulk_actions"
+kind = "feature"
+prompt = ["13_bulk_actions.md", "constraints.md"]
+deploy = "Deploy 2027-03-31"
+summary = "Change status, assignee or due date of all findings matching a filter; concurrent comments and edits never lost"
+favours = "mongodb"
+mechanism = "nested-update"
+why = """\
+updateMany with arrayFilters changes matching nested elements in place; with JSONB every affected \
+document is rewritten, racing with concurrent edits."""
+
+[[phases]]
+name = "move_items"
+kind = "feature"
+prompt = ["14_move_items.md", "constraints.md"]
+deploy = "Deploy 2027-04-14"
+summary = "Move an item with its nested items and findings under another parent; ids kept; concurrent edits survive"
+favours = "mongodb"
+mechanism = "nested-update"
+why = "Moving a subtree inside one document; with child tables it means rewriting parent references and paths."
+
+[[phases]]
+name = "offline_edits"
+kind = "feature"
+prompt = ["15_offline_edits.md", "constraints.md"]
+deploy = "Deploy 2027-04-28"
+summary = "Item revisions; PATCH with ifRev (409 on conflict); batch sync with per-edit results; exactly one concurrent winner"
+favours = "mongodb"
+mechanism = "nested-update"
+why = """\
+Optimistic locking per nested item: a conditional update on the element's rev in MongoDB, vs locking \
+and rewriting the whole JSONB document in Postgres."""
+
+[[phases]]
+name = "item_history"
+kind = "feature"
+prompt = ["16_item_history.md", "constraints.md"]
+deploy = "Deploy 2027-05-12"
+summary = "History of every item and finding change (who, when, before and after), exactly once also under concurrency"
+favours = "neutral"
+mechanism = "cross-cutting"
+why = "Touches every write path; an append-only log is easy in both."
+
+[[phases]]
+name = "rename_field"
+kind = "improvement"
+prompt = ["17_rename_field.md", "constraints.md"]
+deploy = "Deploy 2027-05-26"
+summary = "Rename a nested item field in every version and all stored answers of one form; the old key keeps working"
+favours = "neutral"
+mechanism = "schema-change"
+why = """\
+A deep rename inside arrays is awkward in both ($rename doesn't reach into arrays; JSONB needs \
+rebuilding the nested arrays)."""
+
+[[phases]]
+name = "item_catalog"
+kind = "feature"
+prompt = ["18_item_catalog.md", "constraints.md"]
+deploy = "Deploy 2027-06-09"
+summary = """\
+Company catalogue of equipment types; items reference a type; type renames and intervals show everywhere \
+at once; types in use can't be deleted"""
+favours = "postgres"
+mechanism = "shared-reference"
+why = "A flip: a reference table with a foreign key and joins, vs copies inside documents that must follow changes."
+
+[[phases]]
+name = "findings_dashboard"
+kind = "feature"
+prompt = ["19_findings_dashboard.md", "constraints.md"]
+deploy = "Deploy 2027-06-23"
+summary = "Findings report grouped by severity, status, assignee, form, type and month: counts, open, overdue, time to resolve"
+favours = "postgres"
+mechanism = "cross-entity-report"
+why = "Aggregation across findings, items and the type catalogue: GROUP BY with joins vs pipelines with $unwind and $lookup."
+
+[[phases]]
+name = "due_dates"
+kind = "improvement"
+prompt = ["20_due_dates.md", "constraints.md"]
+deploy = "Deploy 2027-07-07"
+summary = "Due dates from severity for new and existing findings; an overdue flag and filter"
+favours = "neutral"
+mechanism = "time-handling"
+why = "Date arithmetic and a backfill over existing findings; similar in both."
+
+# Phases 21-26 treat a submission as one unit (download, upload, copy, version, restore) and add
+# per-type shapes inside items: aggregate-shaped work, where documents should beat tables.
+
+[[phases]]
+name = "submission_documents"
+kind = "feature"
+prompt = ["21_submission_documents.md", "constraints.md"]
+deploy = "Deploy 2027-07-21"
+summary = """\
+Download a whole submission (items, findings, comments) as one document; upload it back with ifDocRev: \
+diffed into item, finding and comment changes, all or nothing, exactly one concurrent winner"""
+favours = "mongodb"
+mechanism = "whole-document"
+why = """\
+Reading and replacing an aggregate: one document read and one conditional replace in MongoDB, vs \
+assembling and diffing it across tables (or JSONB plus finding tables) in one transaction in Postgres."""
+
+[[phases]]
+name = "export_import"
+kind = "feature"
+prompt = ["22_export_import.md", "constraints.md"]
+deploy = "Deploy 2027-08-04"
+summary = "Export a form with all versions, submissions, findings and types as one JSON; import it with new ids, all or nothing"
+favours = "mongodb"
+mechanism = "whole-document"
+why = """\
+Copying aggregates with id remapping: documents are rewritten as a whole, while tables need every \
+foreign key remapped across items, findings and comments."""
+
+[[phases]]
+name = "snapshots"
+kind = "feature"
+prompt = ["23_snapshots.md", "constraints.md"]
+deploy = "Deploy 2027-08-18"
+summary = "Keep the whole document at every docRev; read any kept version; restore one with ids, findings and comments"
+favours = "mongodb"
+mechanism = "whole-document"
+why = """\
+A version is a copy of one document, and a restore puts it back; in Postgres every change must \
+assemble a snapshot from tables, and a restore must diff it back into them."""
+
+[[phases]]
+name = "reinspection"
+kind = "feature"
+prompt = ["24_reinspection.md", "constraints.md"]
+deploy = "Deploy 2027-09-01"
+summary = "Start a new inspection from an old one: copy the structure with new ids, carry over open findings, link both"
+favours = "mongodb"
+mechanism = "whole-document"
+why = "Deep copy of an aggregate with new ids: a document rewrite vs a recursive copy across tables."
+
+[[phases]]
+name = "type_details"
+kind = "feature"
+prompt = ["25_type_details.md", "constraints.md"]
+deploy = "Deploy 2027-09-15"
+summary = """\
+Item types define their own nested fields; items carry validated details of that shape; company-wide \
+search on details with the same-item rule"""
+favours = "mongodb"
+mechanism = "polymorphic"
+why = """\
+Each type has a different nested shape, defined at runtime: stored and queried as is in documents \
+($elemMatch), vs JSONB with jsonpath built from the type's fields in Postgres."""
+
+[[phases]]
+name = "attachments"
+kind = "feature"
+prompt = ["26_attachments.md", "constraints.md"]
+deploy = "Deploy 2027-09-29"
+summary = "Photos with marks, sensor readings and documents on items, each kind its own shape; filters per kind"
+favours = "mongodb"
+mechanism = "polymorphic"
+why = "Variants with different nested shapes in one list, filtered by kind-specific nested fields."

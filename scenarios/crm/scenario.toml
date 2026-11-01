@@ -1,0 +1,203 @@
+# Agency CRM: contacts, companies and deals for small agencies.
+# Deploy messages look like ordinary deploys; the agent can read git history.
+
+[app]
+app_dir = "agency-crm"   # repo folder the agent sees: /workspace/<app_dir>
+db_name = "crm"
+port = 3200              # runs use port to port + 199
+
+[[phases]]
+name = "initial"
+kind = "feature"
+prompt = ["0_initial.md"]
+deploy = "Deploy 2026-09-30"
+summary = """\
+Companies, contacts (name, email, phone, title, company) and deals (contact, value, stage, close date); \
+filters; deals show the current contact and company names"""
+favours = "neutral"
+mechanism = "baseline"
+why = "Seeded afterwards. Agents tend to start from a normalised design (contacts, companies, deals)."
+
+[[phases]]
+name = "multiple_emails"
+kind = "feature"
+prompt = ["1_multiple_emails.md", "constraints.md"]
+deploy = "Deploy 2026-10-14"
+summary = """\
+Lists of labelled emails and phones; convert existing contacts; email/phone keep working for old clients; \
+filters match any entry"""
+favours = "mongodb"
+mechanism = "schema-change"
+why = "One value becomes a list on live data: an array in a document vs a child table or JSONB column plus conversion."
+
+[[phases]]
+name = "name_search"
+kind = "improvement"
+prompt = ["2_name_search.md", "constraints.md"]
+deploy = "Deploy 2026-10-28"
+summary = "The lastName filter ignores case and accents (garcia finds García)"
+favours = "mongodb"
+mechanism = "text-matching"
+why = "Slightly: MongoDB's collation compares ignoring case and accents; Postgres needs unaccent or a normalised column."
+
+[[phases]]
+name = "custom_fields"
+kind = "feature"
+prompt = ["3_custom_fields.md", "constraints.md"]
+deploy = "Deploy 2026-11-11"
+summary = """\
+Agency-defined fields on contacts and deals (typed, validated, filterable); backfill Talentbridge's \
+seniority from job titles"""
+favours = "mongodb"
+mechanism = "flexible-schema"
+why = "Fields defined at runtime: a sub-document vs EAV or JSONB; the gap is moderate against JSONB."
+
+[[phases]]
+name = "inbound_leads"
+kind = "feature"
+prompt = ["4_inbound_leads.md", "constraints.md"]
+deploy = "Deploy 2026-11-25"
+summary = """\
+Webhooks from two providers (one with two payload versions); raw payload kept and filterable by any path; \
+match or create contacts and companies; idempotent under concurrent retries"""
+favours = "mongodb"
+mechanism = "raw-payload"
+why = "Payloads of different shapes stored as is and filtered by any path, including inside arrays."
+
+[[phases]]
+name = "pipeline_reports"
+kind = "feature"
+prompt = ["5_pipeline_reports.md", "constraints.md"]
+deploy = "Deploy 2026-12-09"
+summary = "Deal counts, values and win rates grouped by stage, close month, company and custom fields of deals and their contacts"
+favours = "postgres"
+mechanism = "cross-entity-report"
+why = "Grouping deals by fields of their contacts and companies: joins and GROUP BY vs $lookup pipelines."
+
+[[phases]]
+name = "open_pipeline"
+kind = "improvement"
+prompt = ["6_open_pipeline.md", "constraints.md"]
+deploy = "Deploy 2026-12-23"
+summary = "Contacts show the total value of their open deals, always current, and can be sorted by it"
+favours = "postgres"
+mechanism = "derived-total"
+why = "A total across records: an aggregate subquery vs a stored copy that must be kept right, also through later merges."
+
+[[phases]]
+name = "contact_merge"
+kind = "feature"
+prompt = ["7_contact_merge.md", "constraints.md"]
+deploy = "Deploy 2027-01-06"
+summary = """\
+Merge duplicates: combine lists and custom values, move deals and leads, keep old ids working, merge history; \
+safe under concurrent, overlapping merges"""
+favours = "postgres"
+mechanism = "transactions"
+why = "Moving records between owners atomically under concurrent, overlapping merges."
+
+[[phases]]
+name = "company_roles"
+kind = "feature"
+prompt = ["8_company_roles.md", "constraints.md"]
+deploy = "Deploy 2027-01-20"
+summary = "Contacts at several companies with a role; a company's contacts; renaming a company shows everywhere"
+favours = "postgres"
+mechanism = "shared-reference"
+why = "Many-to-many with attributes, and names copied into documents must follow renames."
+
+[[phases]]
+name = "activity_timeline"
+kind = "feature"
+prompt = ["9_activity_timeline.md", "constraints.md"]
+deploy = "Deploy 2027-02-03"
+summary = """\
+Calls, emails, meetings and notes with type-specific fields; timelines incl. meetings attended; \
+lastActivityAt on contacts; filters on type fields; merging moves activities"""
+favours = "mongodb"
+mechanism = "polymorphic"
+why = "Variants with different fields in one collection vs a wide table, JSONB or a table per type; attendees are many-to-many."
+
+[[phases]]
+name = "segments"
+kind = "feature"
+prompt = ["10_segments.md", "constraints.md"]
+deploy = "Deploy 2027-02-17"
+summary = """\
+Tags on contacts; saved segments whose nested all/any/not filters over tags, names, custom fields, \
+openPipeline and last activity always show the current contacts"""
+favours = "mongodb"
+mechanism = "stored-query"
+why = "A filter stored as JSON maps almost 1:1 to a MongoDB query; SQL needs a query builder with parameters."
+
+[[phases]]
+name = "follow_ups"
+kind = "improvement"
+prompt = ["11_follow_ups.md", "constraints.md"]
+deploy = "Deploy 2027-03-03"
+summary = "Deals get follow-up dates by stage (also existing open deals), an overdue flag and filters; contacts show their next follow-up"
+favours = "neutral"
+mechanism = "time-handling"
+why = "Defaults that depend on changes, backfilled on live data; Opus used a trigger on Postgres for similar defaults."
+
+[[phases]]
+name = "search"
+kind = "feature"
+prompt = ["12_search.md", "constraints.md"]
+deploy = "Deploy 2027-03-17"
+summary = """\
+One search over contacts, companies and deals: words ignoring case and accents, word forms, \
+text from related records, names ranked first"""
+favours = "neutral"
+mechanism = "search"
+why = "Both have text search built in: MongoDB's $text (any word, one index per collection) vs tsvector with unaccent and weights."
+
+[[phases]]
+name = "currencies"
+kind = "feature"
+prompt = ["13_currencies.md", "constraints.md"]
+deploy = "Deploy 2027-03-31"
+summary = "Deals in other currencies; exchange rates by date; values converted at the close-date rate in reports, openPipeline and segments"
+favours = "postgres"
+mechanism = "shared-reference"
+why = "Every total looks up the rate valid on a date: a join on a range vs $lookup or copies that must follow rate changes."
+
+[[phases]]
+name = "territories"
+kind = "feature"
+prompt = ["14_territories.md", "constraints.md"]
+deploy = "Deploy 2027-04-14"
+summary = "Locations on contacts and companies (contacts fall back to their company's); nearby search with distances; polygon territories with a summary"
+favours = "mongodb"
+mechanism = "geo"
+why = "2dsphere indexes and $near/$geoWithin are built in; stock Postgres has no PostGIS, so distances and polygons are hand-written."
+
+[[phases]]
+name = "import"
+kind = "feature"
+prompt = ["15_import.md", "constraints.md"]
+deploy = "Deploy 2027-04-28"
+summary = "CSV import of up to 5,000 contacts: create or fill in by email, companies by name, rejected rows reported, idempotent"
+favours = "neutral"
+mechanism = "bulk-import"
+why = "Bulk upserts with matching on nested emails; both have bulk writes, the matching is the work."
+
+[[phases]]
+name = "trash"
+kind = "feature"
+prompt = ["16_trash.md", "constraints.md"]
+deploy = "Deploy 2027-05-12"
+summary = "Deleting a contact trashes its deals, activities and leads everywhere; restore with the same ids; purge"
+favours = "neutral"
+mechanism = "whole-document"
+why = "Moving an aggregate and its related records out of every query and back; a flag on each table vs moving documents."
+
+[[phases]]
+name = "webhooks"
+kind = "feature"
+prompt = ["17_webhooks.md", "constraints.md"]
+deploy = "Deploy 2027-05-26"
+summary = "Outbound webhooks for contact and deal changes: signed, retried for 24 hours, in order per contact, never slowing the API"
+favours = "mongodb"
+mechanism = "change-capture"
+why = "Change streams deliver changes in order; Postgres needs an outbox table or LISTEN/NOTIFY."

@@ -1,0 +1,215 @@
+# Maker shops: products, stock and orders for small online shops.
+# Deploy messages look like ordinary deploys; the agent can read git history.
+
+[app]
+app_dir = "maker-shops"   # repo folder the agent sees: /workspace/<app_dir>
+db_name = "shops"
+port = 3400               # runs use port to port + 199
+
+[[phases]]
+name = "initial"
+kind = "feature"
+prompt = ["0_initial.md"]
+deploy = "Deploy 2026-09-30"
+summary = """\
+Products (sku, price, stock, category); orders with several items that take stock all or nothing, prices \
+frozen at order time, cancelling; never oversell under concurrent orders"""
+favours = "neutral"
+mechanism = "baseline"
+why = "Seeded afterwards; already needs transactions for stock, which MongoDB has on the replica set."
+
+[[phases]]
+name = "variants"
+kind = "feature"
+prompt = ["1_variants.md", "constraints.md"]
+deploy = "Deploy 2026-10-14"
+summary = """\
+Options and variants with their own sku, price and stock; convert existing products and order lines; \
+product-level fields keep working for old clients; orders by variant"""
+favours = "mongodb"
+mechanism = "schema-change"
+why = "Variants nest inside products; existing products and order lines are converted while old clients keep working."
+
+[[phases]]
+name = "order_numbers"
+kind = "improvement"
+prompt = ["2_order_numbers.md", "constraints.md"]
+deploy = "Deploy 2026-10-28"
+summary = "Per-shop order numbers from 1001, without gaps even for concurrent or rejected orders; number existing orders by time"
+favours = "neutral"
+mechanism = "counter"
+why = "A counter updated inside the order's transaction in both; sequences leave gaps on rollback."
+
+[[phases]]
+name = "category_attributes"
+kind = "feature"
+prompt = ["3_category_attributes.md", "constraints.md"]
+deploy = "Deploy 2026-11-11"
+summary = """\
+Per-category attribute definitions, typed values, filters with ranges, facet counts; category moves; \
+backfill Northloom's material from product names"""
+favours = "mongodb"
+mechanism = "flexible-schema"
+why = "Attributes defined at runtime per category, with range filters and facets ($facet vs GROUP BY on JSONB)."
+
+[[phases]]
+name = "personalization"
+kind = "feature"
+prompt = ["4_personalization.md", "constraints.md"]
+deploy = "Deploy 2026-11-25"
+summary = "Per-product personalisation fields; validated values on order lines; the same variant twice with different values; filter orders by values"
+favours = "mongodb"
+mechanism = "flexible-schema"
+why = "Values of product-defined fields stored on order lines and filtered by any key."
+
+[[phases]]
+name = "discount_codes"
+kind = "feature"
+prompt = ["5_discount_codes.md", "constraints.md"]
+deploy = "Deploy 2026-12-09"
+summary = """\
+Percent and fixed codes with minimum, validity, max uses and once per customer; discount split over lines; \
+limits hold under concurrent orders; cancelling frees a use"""
+favours = "postgres"
+mechanism = "transactions"
+why = "Usage limits checked and taken atomically with the order, under concurrent orders."
+
+[[phases]]
+name = "returns"
+kind = "feature"
+prompt = ["6_returns.md", "constraints.md"]
+deploy = "Deploy 2026-12-23"
+summary = """\
+Line ids on all orders; partial returns with refunds that add up exactly to what was paid; restocking; \
+statuses; concurrent duplicate returns"""
+favours = "postgres"
+mechanism = "transactions"
+why = "A return, the order's lines and the stock change together; concurrent duplicates must not over-refund."
+
+[[phases]]
+name = "bestsellers"
+kind = "improvement"
+prompt = ["7_bestsellers.md", "constraints.md"]
+deploy = "Deploy 2027-01-06"
+summary = "Products show units sold (net of cancellations and returns), always current, and sort by it"
+favours = "postgres"
+mechanism = "derived-total"
+why = "A total across orders: an aggregate subquery vs a stored counter kept right through cancels and returns."
+
+[[phases]]
+name = "sales_reports"
+kind = "feature"
+prompt = ["8_sales_reports.md", "constraints.md"]
+deploy = "Deploy 2027-01-20"
+summary = """\
+Sales grouped by day, month, product, variant, current category, variant option, current attribute and \
+discount code, with discounts and refunds; date range"""
+favours = "postgres"
+mechanism = "cross-entity-report"
+why = "Grouping order lines by current product data and summing refunds: joins and GROUP BY vs $lookup pipelines."
+
+[[phases]]
+name = "reviews"
+kind = "feature"
+prompt = ["9_reviews.md", "constraints.md"]
+deploy = "Deploy 2027-02-03"
+summary = """\
+Reviews by verified buyers, one per customer and product; moderation; helpful votes once per email; \
+ratings on products, always current, filter and sort"""
+favours = "neutral"
+mechanism = "derived-total"
+why = "Reviews grow without bound (embedding them in products is a trap); averages must follow edits and moderation."
+
+[[phases]]
+name = "search"
+kind = "feature"
+prompt = ["10_search.md", "constraints.md"]
+deploy = "Deploy 2027-02-17"
+summary = """\
+Search as you type over names, descriptions, categories, skus and attribute values: every word, accents, \
+word forms, prefix of the last word; names first, then best sellers"""
+favours = "postgres"
+mechanism = "search"
+why = "tsquery supports prefixes (:*) and AND; MongoDB's $text matches any word and no prefixes, so agents fall back to regexes."
+
+[[phases]]
+name = "translations"
+kind = "feature"
+prompt = ["11_translations.md", "constraints.md"]
+deploy = "Deploy 2027-03-03"
+summary = """\
+Shop languages; translated names, descriptions and option values merged per language; reading, \
+searching and ordering in a language with fallback"""
+favours = "mongodb"
+mechanism = "nested-query"
+why = "Translations nest per language and field inside the product; reads pick and fall back per field."
+
+[[phases]]
+name = "carts"
+kind = "feature"
+prompt = ["12_carts.md", "constraints.md"]
+deploy = "Deploy 2027-03-17"
+summary = """\
+Carts hold stock for a configurable time; available stock excludes holds; expired holds free stock at \
+once; checkout; never over-hold under concurrent carts"""
+favours = "neutral"
+mechanism = "expiry"
+why = "TTL indexes delete expired carts only about once a minute, so availability must be computed from expiry times in both."
+
+[[phases]]
+name = "delivery"
+kind = "feature"
+prompt = ["13_delivery.md", "constraints.md"]
+deploy = "Deploy 2027-03-31"
+summary = "Delivery zones as polygons with fees and free thresholds; pickup points nearest first; shipping fees on orders"
+favours = "mongodb"
+mechanism = "geo"
+why = "$geoIntersects and $near are built in; stock Postgres has no PostGIS, so point-in-polygon and distances are hand-written."
+
+[[phases]]
+name = "subscriptions"
+kind = "feature"
+prompt = ["14_subscriptions.md", "constraints.md"]
+deploy = "Deploy 2027-04-14"
+summary = """\
+Recurring orders on a schedule, placed by a daily run that may be repeated or concurrent; skips, \
+history, pause and resume"""
+favours = "neutral"
+mechanism = "idempotency"
+why = "A run must never place two orders for the same date, even when two runs race: a unique key in both."
+
+[[phases]]
+name = "order_edits"
+kind = "feature"
+prompt = ["15_order_edits.md", "constraints.md"]
+deploy = "Deploy 2027-04-28"
+summary = """\
+Edit placed orders with optimistic versions: lines kept or added, stock adjusted all or nothing, \
+discount and fees recomputed; full earlier revisions"""
+favours = "mongodb"
+mechanism = "whole-document"
+why = "An order is an aggregate: replace it with a version check and keep snapshots, vs rewriting lines across tables."
+
+[[phases]]
+name = "craftly_import"
+kind = "feature"
+prompt = ["16_craftly_import.md", "constraints.md"]
+deploy = "Deploy 2027-05-12"
+summary = """\
+Import marketplace listings (nested variations) as products; update by listing id; inactive products; \
+raw listing kept; rejected listings; 2,000 listings within 60 s"""
+favours = "mongodb"
+mechanism = "bulk-import"
+why = "Nested external JSON mapped to products and stored as is, upserted in bulk."
+
+[[phases]]
+name = "stock_history"
+kind = "feature"
+prompt = ["17_stock_history.md", "constraints.md"]
+deploy = "Deploy 2027-05-26"
+summary = """\
+Every stock change recorded as a movement (orders, cancels, returns, edits, imports, adjustments); \
+opening balances; stock at any moment; movements add up under concurrency"""
+favours = "postgres"
+mechanism = "cross-cutting"
+why = "Every write path that touches stock must also write a movement in the same transaction; a trigger can do it in Postgres."
