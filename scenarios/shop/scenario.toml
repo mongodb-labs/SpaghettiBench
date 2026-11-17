@@ -1,5 +1,9 @@
 # Maker shops: products, stock and orders for small online shops.
 # Deploy messages look like ordinary deploys; the agent can read git history.
+#
+# [[merged]] is the one-shot variant (harness.run --mode merged): the first step builds the app from the
+# whole spec, the app is seeded, then the later steps do the data changes that only make sense once
+# production data exists. Every step is checked with the checks of all phases.
 
 [app]
 app_dir = "maker-shops"   # repo folder the agent sees: /workspace/<app_dir>
@@ -213,3 +217,20 @@ opening balances; stock at any moment; movements add up under concurrency"""
 favours = "postgres"
 mechanism = "cross-cutting"
 why = "Every write path that touches stock must also write a movement in the same transaction; a trigger can do it in Postgres."
+
+[[merged]]
+name = "build"
+prompt = ["merged/spec.md"]
+deploy = "Deploy 2026-09-30"
+
+[[merged]]
+name = "data_changes"
+prompt = ["merged/data_changes.md", "constraints.md"]
+deploy = "Deploy 2026-10-14"
+
+# Change requests given to every finished app, step by step or one-shot (harness.probe), to compare how
+# easy the code each mode left behind is to change. Not part of a run's phases.
+[[probes]]
+name = "vat"
+prompt = ["probes/vat.md", "constraints.md"]
+deploy = "Deploy 2027-06-09"

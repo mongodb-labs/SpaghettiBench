@@ -13,6 +13,8 @@ from scenarios.shop import checks, seed, storage
 _settings = load(Path(__file__).parent)
 APP_DIR, DB_NAME, PORT = _settings["app_dir"], _settings["db_name"], _settings["port"]
 PHASES = _settings["phases"]
+MERGED = _settings["merged"]  # one-shot steps; empty if the scenario has none
+PROBES = _settings["probes"]  # change requests for finished apps (harness.probe)
 
 
 def seed_data(base_url: str) -> dict[str, Any]:
@@ -21,6 +23,10 @@ def seed_data(base_url: str) -> dict[str, Any]:
 
 def run_checks(phase: str, base_url: str, seeded: dict[str, Any] | None) -> dict[str, Any]:
     return checks.run(phase, base_url, seeded)
+
+
+def probe_checks(probe: str, base_url: str, seeded: dict[str, Any] | None) -> dict[str, Any]:
+    return checks.run_probe(probe, base_url, seeded)
 
 
 def after_checks(run: Any, phase: str) -> dict[str, Any]:

@@ -142,5 +142,7 @@ def trace_metrics(path: Path) -> dict[str, Any]:
         "tool_calls": dict(tools),
         "bash_calls": tools["Bash"],
         "tool_errors": tool_errors,
+        # Claude Code summarised the conversation because the context window filled up
+        "compactions": sum(1 for e in events if e.get("type") == "system" and e.get("subtype") == "compact_boundary"),
         **{f"{cat}_calls": intents[cat] for cat in CATEGORIES},
     }

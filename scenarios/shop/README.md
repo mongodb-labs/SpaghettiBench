@@ -15,7 +15,12 @@ Repo folder in the container: `/workspace/maker-shops`, database `shops`, app po
 
 The stages, with what each change asks for, which database it is expected to favour and why, are in
 [scenario.toml](scenario.toml). Every change prompt is followed by
-[prompts/constraints.md](prompts/constraints.md).
+[prompts/constraints.md](prompts/constraints.md). For one-shot runs (`--mode merged`),
+[prompts/merged/spec.md](prompts/merged/spec.md) is all stages as one spec, and
+[prompts/merged/data_changes.md](prompts/merged/data_changes.md) the one change to seeded data (Northloom's
+materials) that comes after the seed. [prompts/probes/vat.md](prompts/probes/vat.md) is the change-request probe
+given to finished runs (`harness.probe`): VAT rates per shop and category, included in order lines, shipping,
+returns and sales reports, frozen at order time; its checks are [checks/vat.py](checks/vat.py).
 
 ## Seed data
 
@@ -78,3 +83,7 @@ email addresses compare case-insensitively.
   lock), fails exactly the concurrent-order checks (stock, order numbers, max uses, once per customer)
 - an app whose expired carts hold stock until a cleanup runs (a TTL index) fails exactly the expiry check
 - an app that ignores `version` on edits fails exactly the version checks
+- the one-shot order (`--mode merged`: seed the finished app, every check, the material backfill, every
+  check again) passes every check
+- the `vat` probe's checks pass on the finished reference app, next to every phase's checks; an app that
+  shows tax at the current rates instead of those at order time fails exactly the two frozen-rate checks

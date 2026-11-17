@@ -10,6 +10,8 @@ from scenarios.inspections import checks, seed, storage
 _settings = load(Path(__file__).parent)
 APP_DIR, DB_NAME, PORT = _settings["app_dir"], _settings["db_name"], _settings["port"]
 PHASES = _settings["phases"]
+MERGED = _settings["merged"]  # one-shot steps; empty if the scenario has none
+PROBES = _settings["probes"]  # change requests for finished apps (harness.probe)
 
 
 def seed_data(base_url: str) -> dict[str, Any]:

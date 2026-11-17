@@ -2,6 +2,7 @@
 
 Usage:
   uv run -m harness.batch --scenario crm inspections --db postgres mongodb --repetition 1-3 --parallel 6 --fix-rounds 2
+  uv run -m harness.batch --scenario shop --db postgres mongodb --repetition 1-3 --mode merged --fix-rounds 2
   uv run -m harness.batch ... -- --fix-rounds 1        (anything after -- is passed on to harness.run)
 
 --repetition takes repetition numbers, like harness.run: 1-3 means runs rep1, rep2 and rep3.
@@ -20,7 +21,8 @@ import threading
 import time
 from concurrent.futures import ThreadPoolExecutor
 
-from harness.run import ARMS, ROOT, RUNS, SCENARIOS, load_scenario, phases_done, read_rows, resume_point
+from harness.run import (ARMS, ROOT, RUNS, SCENARIOS, load_scenario, phases_done, read_rows, resume_point,
+                         run_label)
 
 _print_lock = threading.Lock()
 _stopping = threading.Event()
@@ -40,13 +42,30 @@ def repetitions(text: str) -> list[int]:
     return out
 
 
-def run_one(scenario: str, db: str, rep: int, extra: list[str]) -> tuple[str, int]:
-    name = f"{scenario}/{db}_rep{rep}"
+def build_image() -> None:
+    """Build the agent image once, so parallel runs don't each build it (HARNESS_IMAGE_BUILT tells them)."""
+    say("Building the agent image")
+    version = os.environ.get("CLAUDE_CODE_VERSION") or "latest"
+    for attempt in range(3):  # Docker Desktop on Windows sometimes reports its context metadata as locked
+        build = subprocess.run(["docker", "build", "-q", "-t", f"pilot-workspace:{version}", "--build-arg",
+                                f"CLAUDE_CODE_VERSION={version}",
+                                str(ROOT / "agent")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
+        if not build.returncode or "being used by another process" not in build.stderr:
+            break
+        time.sleep(3)
+    if build.returncode:
+        sys.exit(f"Building the agent image failed:\n{build.stderr[-2000:]}")
+    os.environ["HARNESS_IMAGE_BUILT"] = "1"
+
+
+def run_one(scenario: str, db: str, rep: int, mode: str, extra: list[str]) -> tuple[str, int]:
+    name = f"{scenario}/{run_label(db, rep, mode)}"
     if _stopping.is_set():
         return name, -1
-    folder = RUNS / scenario / f"{db}_rep{rep}"
+    folder = RUNS / name
     folder.mkdir(parents=True, exist_ok=True)
-    cmd = [sys.executable, "-m", "harness.run", "--scenario", scenario, "--db", db, "--repetition", str(rep), *extra]
+    cmd = [sys.executable, "-m", "harness.run", "--scenario", scenario, "--db", db, "--repetition", str(rep),
+           "--mode", mode, *extra]
     say(f"[{name}] started")
     tail: list[str] = []
     with open(folder / "console.log", "a", encoding="utf-8") as log:
@@ -79,6 +98,8 @@ def main() -> None:
                    help="runs at the same time (default 6); each needs a few GB of Docker memory")
     p.add_argument("--fix-rounds", type=int, required=True,
                    help="bug-report rounds after a phase with failing checks (0 = off)")
+    p.add_argument("--mode", choices=["incremental", "merged"], default="incremental",
+                   help="incremental (default) or merged: the whole spec at once (see harness.run --mode)")
     p.add_argument("--yes", action="store_true", help="start without asking for confirmation")
     p.add_argument("--resume", action="store_true",
                    help="continue existing runs with the phases they haven't done yet (see harness.run --resume)")
@@ -89,49 +110,43 @@ def main() -> None:
 
     # Repetition first, so both databases and all scenarios progress evenly.
     jobs = [(s, d, r) for r, s, d in itertools.product(a.repetition, a.scenario, a.db)]
-    total = {s: len(load_scenario(s).PHASES) for s in a.scenario}
-    done = {job: len(phases_done(RUNS / job[0] / f"{job[1]}_rep{job[2]}")) for job in jobs}
+    label = lambda job: f"{job[0]}/{run_label(job[1], job[2], a.mode)}"
+    steps = {s: load_scenario(s).MERGED if a.mode == "merged" else load_scenario(s).PHASES for s in a.scenario}
+    missing = [s for s, st in steps.items() if not st]
+    if missing:
+        sys.exit(f"no [[merged]] steps in the scenario.toml of: {', '.join(missing)}")
+    total = {s: len(st) for s, st in steps.items()}
+    done = {job: len(phases_done(RUNS / label(job))) for job in jobs}
     existing = [job for job in jobs if done[job]]
     if existing and not (a.resume or a.overwrite):
         say(f"{len(existing)} of the {len(jobs)} planned runs already have results:")
-        for s, d, r in existing:
-            say(f"  {s}/{d}_rep{r}: {done[(s, d, r)]}/{total[s]} phases done")
+        for job in existing:
+            say(f"  {label(job)}: {done[job]}/{total[job[0]]} phases done")
         choice = "" if a.yes else input("[r]esume them, [o]verwrite them, or [c]ancel? ").strip().lower()[:1]
         if choice not in ("r", "o"):
             sys.exit("Nothing started." + (" (--yes needs --resume or --overwrite for existing runs)" if a.yes else ""))
         a.resume, a.overwrite = choice == "r", choice == "o"
     if a.resume:
-        complete = [job for job in existing if resume_point(read_rows(RUNS / job[0] / f"{job[1]}_rep{job[2]}"),
-                                                            total[job[0]], a.fix_rounds) is None]
-        for s, d, r in complete:
-            say(f"  {s}/{d}_rep{r}: all {total[s]} phases done, skipped")
+        complete = [job for job in existing if resume_point(read_rows(RUNS / label(job)), steps[job[0]],
+                                                            a.fix_rounds) is None]
+        for job in complete:
+            say(f"  {label(job)}: all {total[job[0]]} phases done, skipped")
         jobs = [job for job in jobs if job not in complete]
     flag = ["--resume"] if a.resume else ["--overwrite"] if a.overwrite else []
     extra = ["--fix-rounds", str(a.fix_rounds), *extra]
 
     say(f"About to start {len(jobs)} runs, {a.parallel} at a time" + (f", passing on: {' '.join(extra)}" if extra else ""))
-    for s, d, r in jobs:
-        mode = ("resume" if a.resume else "overwrite") if done[(s, d, r)] else "new"
-        say(f"  {s}/{d}_rep{r}  ({mode})")
+    for job in jobs:
+        mode = ("resume" if a.resume else "overwrite") if done[job] else "new"
+        say(f"  {label(job)}  ({mode})")
     if not jobs:
         sys.exit("Nothing to run.")
     if not a.yes and input("Start? [y/N] ").strip().lower() not in ("y", "yes"):
         sys.exit("Nothing started.")
-    say("Building the agent image")
-    version = os.environ.get("CLAUDE_CODE_VERSION") or "latest"
-    for attempt in range(3):  # Docker Desktop on Windows sometimes reports its context metadata as locked
-        build = subprocess.run(["docker", "build", "-q", "-t", f"pilot-workspace:{version}", "--build-arg",
-                                f"CLAUDE_CODE_VERSION={version}",
-                                str(ROOT / "agent")], stdin=subprocess.DEVNULL, capture_output=True, text=True)
-        if not build.returncode or "being used by another process" not in build.stderr:
-            break
-        time.sleep(3)
-    if build.returncode:
-        sys.exit(f"Building the agent image failed:\n{build.stderr[-2000:]}")
-    os.environ["HARNESS_IMAGE_BUILT"] = "1"
+    build_image()
     results: list[tuple[str, int]] = []
     pool = ThreadPoolExecutor(a.parallel)
-    futures = [pool.submit(run_one, s, d, r, extra + (flag if done[(s, d, r)] else [])) for s, d, r in jobs]
+    futures = [pool.submit(run_one, s, d, r, a.mode, extra + (flag if done[(s, d, r)] else [])) for s, d, r in jobs]
     try:
         for f in futures:
             results.append(f.result())

@@ -12,6 +12,7 @@ services:
     environment:
       # Empty entries pass the host value through, or leave the variable unset if the host has none
       ANTHROPIC_API_KEY:
+      ANTHROPIC_BASE_URL:
       ANTHROPIC_FOUNDRY_API_KEY:
       ANTHROPIC_FOUNDRY_BASE_URL:
       ANTHROPIC_CUSTOM_HEADERS:

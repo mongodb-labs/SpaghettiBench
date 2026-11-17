@@ -24,6 +24,7 @@ RACY_CHECKS = {
 LAZY_EXPIRY_CHECKS = {"v10.expired_holds_free_stock_at_once"}
 # the accepted stale edit also shifts the version and revision counts the next check expects
 UNVERSIONED_CHECKS = {"v13.rejected_edits_change_nothing", "v13.concurrent_edits_one_wins", "v13.revisions_and_cancel"}
+LIVE_TAX_CHECKS = {"vat.rates_frozen_at_order_time", "vat.edits_keep_rates_of_kept_lines"}
 
 
 def lifecycle(base: str, until: str | None = None) -> tuple[dict, dict]:
@@ -92,6 +93,38 @@ def test_checks_pass_again_when_rerun(reference):
     base, data, _ = reference
     rerun = checks.run(checks.PHASES[-1], base, data)
     assert not {k: v.get("detail") for k, v in rerun.items() if not v["pass"]}
+
+
+def test_merged_run_passes_every_check():
+    """The one-shot order (harness.run --mode merged): seed the finished app, run every check, do the data
+    change, run every check again."""
+    srv, base = serve()
+    try:
+        data = seed.run(base)
+        checks.run(checks.PHASES[-1], base, data)
+        httpx.post(f"{base}/__backfill_material")
+        results = checks.run(checks.PHASES[-1], base, data)
+    finally:
+        srv.shutdown()
+    assert not data["failures"], data["failures"][:3]
+    assert not {k: v.get("detail") for k, v in results.items() if not v["pass"]}
+
+
+def test_vat_probe_passes_on_a_finished_app(reference):
+    """The probe runs after the whole lifecycle, next to every phase's checks (harness.probe)."""
+    base, data, _ = reference
+    results = {**checks.run(checks.PHASES[-1], base, data), **checks.run_probe("vat", base, data)}
+    assert any(k.startswith("vat.") for k in results)
+    assert not {k: v.get("detail") for k, v in results.items() if not v["pass"]}
+
+
+def test_live_tax_rates_fail_exactly_the_frozen_rate_checks():
+    srv, base = serve(live_tax_rates=True)
+    try:
+        results = checks.run_probe("vat", base, seed.run(base))
+    finally:
+        srv.shutdown()
+    assert failed({"vat": results}) == LIVE_TAX_CHECKS
 
 
 def test_live_prices_fail_exactly_the_price_at_order_time_checks(live_prices):

@@ -22,12 +22,13 @@ Each scenario's phases, with the database each is expected to favour and why, ar
 
 ## Running
 
-Needs Docker Desktop, [uv](https://docs.astral.sh/uv/) and a Grove (or Anthropic) API key.
+Needs Docker Desktop, [uv](https://docs.astral.sh/uv/) and an AI gateway (or Grove, or Anthropic) API key.
 
 ```bat
 uv sync
 copy .env.example .env
-:: put your key in .env (ANTHROPIC_FOUNDRY_API_KEY); CLAUDE_MODEL must be the same for runs you compare
+:: put your key in .env (AI_GATEWAY_API_KEY; it takes precedence over the Grove/Foundry settings, whose
+:: gateway cuts requests off after about 4 minutes); CLAUDE_MODEL must be the same for runs you compare
 :: another model: set CLAUDE_MODEL and RUNS_DIR (e.g. runs_sonnet) in .env; every command then uses that folder
 
 :: several runs in parallel; lists them and asks before starting, then builds the agent image once
@@ -36,13 +37,15 @@ uv run -m harness.batch --scenario inspections --db postgres mongodb --repetitio
 uv run -m harness.run --scenario inspections --db postgres --repetition 1 --fix-rounds 2
 
 uv run -m harness.watch inspections/postgres_rep1   :: follow the agent live
-uv run -m harness.report                            :: results (--details for every run and failing check)
+uv run -m harness.report                            :: results (--details for every run and failing check;
+                                                    :: always also writes <runs>/report.html with everything, --open opens it)
 uv run -m harness.audit                             :: flagged agent commands (looking outside the repo, destructive, live DB)
 ```
 
 | Option | Meaning |
 |---|---|
 | `--repetition` | Run number (1–99; batch: `1-3` or `4,5`); also sets the app port |
+| `--mode merged` | The whole spec at once instead of phase by phase (see below) |
 | `--fix-rounds` | After failing checks, a fresh agent gets a QA-style bug report, up to this many times |
 | `--resume` | Continue existing runs with the phases they haven't done (after phases were added): restores code and database from the last attempt |
 | `--overwrite` | Delete existing results and start again |
@@ -50,6 +53,43 @@ uv run -m harness.audit                             :: flagged agent commands (l
 | `--max-turns`, `--timeout-min`, `--model` | Per-phase limits (200 turns, 180 min) and model override |
 
 Without `--resume` or `--overwrite`, existing results make the run ask which you want.
+
+### One-shot runs (`--mode merged`)
+
+To compare with an agent that knows every requirement up front, a scenario can define `[[merged]]` steps
+in its `scenario.toml` (so far: `shop`):
+
+1. **build**: one session gets the whole spec at once (`prompts/merged/spec.md`, consolidated by hand from
+   all phases, with later changes already applied). It gets the turn and time limits of all phases together
+   (e.g. 18 × 200 turns). Then deploy, seed (plus everything `seed_more` adds over time) and run every
+   phase's checks. Its fix rounds only fix a deploy that doesn't start.
+2. **data_changes**: a fresh session gets the requests that change specific production data and so only make
+   sense once it exists (e.g. backfilling Northloom's materials), with `constraints.md`. Then every check
+   again, with the usual fix rounds.
+
+```bat
+uv run -m harness.batch --scenario shop --db postgres mongodb --repetition 1-3 --mode merged --fix-rounds 2
+```
+
+Results go to `<db>_merged_rep<N>` next to the step-by-step runs; `harness.report` then adds a
+**one-shot vs step by step** section: effort, context compactions, code size, data model, and the full
+check suite at the end, overall and by the phase each check came from. Merged runs take repetitions 1–49.
+`scenarios/<name>/tests` replays the one-shot order against the reference app, so the checks are known to
+be satisfiable in that order.
+
+### Change-request probes (`harness.probe`)
+
+To compare how easy the finished code is to change, a scenario's `[[probes]]` (so far: `shop`'s `vat`) is one
+more unseen change request given to every complete run, step by step and one-shot alike. For each run, in its
+own containers: restore the final code and database, one fresh agent session with the probe's prompt and
+`constraints.md`, deploy, then every phase's checks (failures are regressions) plus the probe's own checks, with
+the usual fix rounds. Results go to `<run>/probes/<probe>/`.
+
+```bat
+uv run -m harness.probe --scenario shop --probe vat --fix-rounds 2 --parallel 4
+```
+
+Don't probe a run while it is running: the probe uses its app port.
 
 ## What a run does
 
@@ -75,12 +115,24 @@ ordinary deploys, names are neutral, and every prompt goes to a fresh session.
   `unexecuted` = share of the phase's added code lines that no check executed (Node coverage while the
   checks run; tests and migration files left out), a sign of speculative code.
 - **Totals per database** over complete runs.
+- **Code quality at the end** of every complete run, from its saved code with
+  [lizard](https://github.com/terryyin/lizard) (about 20 languages, nothing to set up per language): share of
+  the code in the largest file, function length and cyclomatic complexity (90th percentile and maximum),
+  share of the code in functions with complexity above 10, and duplicated code. Only the agent's own source
+  counts (no dependencies, vendored copies, build output or tests); lower is cleaner. Cached per commit in
+  `<run>/code_quality.json`.
+- **Change-request probes** (if any were run): cost, first-try and final pass rate of the probe's checks,
+  and regressions.
 - **Verification**: runs that need a look (app didn't start, data not in the forced database, checks
   still failing after the fix rounds, seeded data lost in storage).
 
+`<runs>/report.html` has the same tables, one scenario per tab, with every `--details` table in collapsed
+sections and sortable columns.
+
 In a run folder: `metrics.jsonl` (one row per attempt), `traces/` (full agent transcripts),
 `dumps/` (data after each attempt), `db_<phase>.*` (schema), `repo.bundle` (the code:
-`git clone repo.bundle code`), `app_<phase>.log`.
+`git clone repo.bundle code`), `workspace_extra.tgz` (files git ignores but the app may need, e.g. a vendored
+package's `dist/`; restored with the code), `app_<phase>.log`.
 
 Older result sets: `runs_standalone/` (MongoDB without a replica set) and `runs_7phases/`; read them
 with `--runs <folder>`. Costs are list-price estimates, and runs are noisy: compare medians.

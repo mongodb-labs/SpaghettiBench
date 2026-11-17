@@ -11,6 +11,8 @@ from __future__ import annotations
 from pathlib import Path
 from typing import Callable
 
+import httpx
+
 from harness.scenario_file import load
 from harness.suite import client
 from scenarios.shop.checks.bestsellers import i2
@@ -31,10 +33,18 @@ from scenarios.shop.checks.stock_history import v15
 from scenarios.shop.checks.subscriptions import v12
 from scenarios.shop.checks.translations import v9
 from scenarios.shop.checks.variants import v1
+from scenarios.shop.checks.vat import vat
 
-__all__ = ["PHASES", "run"]
+__all__ = ["PHASES", "PROBES", "run", "run_probe"]
 
 PHASES = [p["name"] for p in load(Path(__file__).parents[1])["phases"]]
+# Change requests given to finished apps (harness.probe); each runs after all phases' checks.
+PROBES: dict[str, Callable[[httpx.Client, dict | None], dict]] = {"vat": vat}
+
+
+def run_probe(probe: str, base_url: str, seed: dict | None) -> dict:
+    with client(base_url) as c:
+        return PROBES[probe](c, seed)
 
 
 def run(phase: str, base_url: str, seed: dict | None) -> dict:

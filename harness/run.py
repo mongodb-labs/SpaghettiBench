@@ -1,6 +1,6 @@
 """Run one pilot lifecycle for one scenario and database arm: initial build, seed, then each change phase.
 
-Usage: uv run -m harness.run --scenario NAME --db {postgres,mongodb} --repetition N [--model MODEL_ID]
+Usage: uv run -m harness.run --scenario NAME --db {postgres,mongodb} --repetition N [--mode merged] [--model MODEL_ID]
 Settings (API key, model, Claude Code version) are read from .env in the project root.
 """
 from __future__ import annotations
@@ -28,8 +28,18 @@ from harness.traces import trace_metrics
 
 ROOT = Path(__file__).resolve().parents[1]
 load_dotenv(ROOT / ".env")
+AI_GATEWAY_URL = "https://ai-gateway.corp.mongodb.com/anthropic"
+if os.environ.get("AI_GATEWAY_API_KEY"):
+    # The AI gateway speaks the plain Anthropic API (key as x-api-key) and has no ~4-minute request limit,
+    # which long one-shot requests ran into on Grove/Foundry; it takes precedence over the Foundry settings.
+    # Emptied rather than removed: docker compose would otherwise take them from .env again.
+    for var in ("CLAUDE_CODE_USE_FOUNDRY", "CLAUDE_CODE_SKIP_FOUNDRY_AUTH", "ANTHROPIC_FOUNDRY_API_KEY",
+                "ANTHROPIC_FOUNDRY_BASE_URL", "ANTHROPIC_CUSTOM_HEADERS"):
+        os.environ[var] = ""
+    os.environ["ANTHROPIC_BASE_URL"] = os.environ.get("AI_GATEWAY_BASE_URL") or AI_GATEWAY_URL
+    os.environ["ANTHROPIC_API_KEY"] = os.environ["AI_GATEWAY_API_KEY"]
 # With CLAUDE_CODE_SKIP_FOUNDRY_AUTH, Claude Code sends no key; the Grove gateway wants it as an api-key header.
-if os.environ.get("ANTHROPIC_FOUNDRY_API_KEY") and not os.environ.get("ANTHROPIC_CUSTOM_HEADERS"):
+elif os.environ.get("ANTHROPIC_FOUNDRY_API_KEY") and not os.environ.get("ANTHROPIC_CUSTOM_HEADERS"):
     os.environ["ANTHROPIC_CUSTOM_HEADERS"] = f"api-key: {os.environ['ANTHROPIC_FOUNDRY_API_KEY']}"
 RUNS = ROOT / os.environ.get("RUNS_DIR", "runs")
 SCENARIOS = sorted(p.name for p in (ROOT / "scenarios").iterdir() if (p / "__init__.py").exists())
@@ -38,6 +48,9 @@ LOCKFILES = ["package-lock.json", "yarn.lock", "pnpm-lock.yaml", "bun.lockb", "u
              "poetry.lock", "Pipfile.lock", "go.sum", "Cargo.lock"]
 PATHSPEC = "-- . " + " ".join(f"':(exclude,glob)**/{f}'" for f in LOCKFILES)
 BOOKKEEPING = re.compile(r"migration|alembic|schema_version|knex_|drizzle|changelog", re.I)
+# Saved with the code after every attempt: files git ignores but the app may need (see export_repo).
+EXTRA = "workspace_extra.tgz"
+DEPENDENCY_DIRS = r"(^|/)(node_modules|\.venv|venv|__pycache__)/?$"
 
 
 def parse_numstat(text: str) -> dict[str, tuple[int, int]]:
@@ -89,13 +102,20 @@ def phases_done(run_dir: Path) -> list[str]:
     return list(dict.fromkeys(r["phase"] for r in read_rows(run_dir)))
 
 
-def resume_point(rows: list[dict[str, Any]], phase_count: int, fix_rounds: int) -> tuple[int, int] | None:
+def run_label(arm: str, rep: int, mode: str = "incremental") -> str:
+    """A run's folder name under runs/<scenario>/: postgres_rep1, or postgres_merged_rep1 for a one-shot run."""
+    return f"{arm}_merged_rep{rep}" if mode == "merged" else f"{arm}_rep{rep}"
+
+
+def resume_point(rows: list[dict[str, Any]], phases: list[dict[str, Any]], fix_rounds: int) -> tuple[int, int] | None:
     """(step, attempt) to continue with: the next fix round of a failing last phase, else the next phase; None if complete."""
     done = list(dict.fromkeys(r["phase"] for r in rows))
     last = rows[-1]
-    if (not last["app_started"] or last["checks_passed"] != last["checks_total"]) and last["attempt"] < fix_rounds:
+    fix_checks = next((ph.get("fix") for ph in phases if ph["name"] == last["phase"]), None) != "startup"
+    failing = not last["app_started"] or (fix_checks and last["checks_passed"] != last["checks_total"])
+    if failing and last["attempt"] < fix_rounds:
         return len(done), last["attempt"] + 1
-    return (len(done) + 1, 0) if len(done) < phase_count else None
+    return (len(done) + 1, 0) if len(done) < len(phases) else None
 
 
 def clear_results(run_dir: Path) -> None:
@@ -106,17 +126,26 @@ def clear_results(run_dir: Path) -> None:
 
 
 class Run:
-    def __init__(self, scenario: str, arm: str, rep: int, model: str, max_turns: int, timeout_s: int):
-        self.scenario, self.arm, self.rep, self.model = scenario, arm, rep, model
+    def __init__(self, scenario: str, arm: str, rep: int, model: str, max_turns: int, timeout_s: int,
+                 mode: str = "incremental", probe: str | None = None):
+        self.scenario, self.arm, self.rep, self.model, self.mode = scenario, arm, rep, model, mode
         self.sc = load_scenario(scenario)
+        # What the run steps through: the scenario's phases, or its one-shot steps (scenario.toml [[merged]]).
+        self.phases = self.sc.MERGED if mode == "merged" else self.sc.PHASES
         self.max_turns, self.timeout_s = max_turns, timeout_s
-        self.name = f"{scenario}/{arm}_rep{rep}"
+        label = run_label(arm, rep, mode)
+        self.name = f"{scenario}/{label}"
         # Results folders other than runs/ get their own Docker projects, so their leftovers never mix.
         prefix = "" if RUNS.name == "runs" else re.sub(r"[^a-z0-9]+", "-", RUNS.name.lower()).strip("-") + "_"
-        self.project = f"{prefix}{scenario}_{arm}_rep{rep}"
-        self.dir = RUNS / scenario / f"{arm}_rep{rep}"
+        self.project = f"{prefix}{scenario}_{label}"
+        self.dir = RUNS / scenario / label
+        if probe:
+            # A change request given to the finished run (harness.probe): its own folder and containers.
+            self.phases = [p for p in self.sc.PROBES if p["name"] == probe]
+            self.name, self.project, self.dir = f"{self.name}+{probe}", f"{self.project}_{probe}", self.dir / "probes" / probe
         self.db = self.sc.DB_NAME
-        port = self.sc.PORT + 100 * list(ARMS).index(arm) + rep
+        # Merged runs use the upper half of the arm's port range (so repetitions 1-49 don't clash).
+        port = self.sc.PORT + 100 * list(ARMS).index(arm) + (50 if mode == "merged" else 0) + rep
         self.base_url = f"http://localhost:{port}"
         self.env = {**os.environ, "APP_PORT": str(port), "APP_DIR": self.sc.APP_DIR, "DB_NAME": self.db,
                     "DB_URL": ARMS[arm]["db_url"].format(db=self.db),
@@ -178,8 +207,8 @@ class Run:
         self.start_containers()
         self.sh("git init -q && printf 'node_modules/\\n.venv/\\n__pycache__/\\ndist/\\nbuild/\\n' > .gitignore")
         self.prev = self.commit("Initial commit")
-        meta = {"scenario": self.scenario, "arm": self.arm, "repetition": self.rep, "model": self.model,
-                "max_turns": self.max_turns,
+        meta = {"scenario": self.scenario, "arm": self.arm, "repetition": self.rep, "mode": self.mode,
+                "model": self.model, "max_turns": self.max_turns,
                 "claude_code_version": self.sh("claude --version"), "base_url": self.base_url,
                 "started_at": dt.datetime.now(dt.timezone.utc).isoformat()}
         (self.dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
@@ -191,19 +220,33 @@ class Run:
         if recorded != self.model:
             sys.exit(f"{self.name}: recorded with {recorded}, not {self.model}; use another RUNS_DIR for another model")
         done = list(dict.fromkeys(r["phase"] for r in rows))
-        names = [ph["name"] for ph in self.sc.PHASES]
+        names = [ph["name"] for ph in self.phases]
         if done != names[:len(done)]:
             sys.exit(f"{self.name}: recorded phases {done} are not the start of the scenario's phases {names}")
-        point = resume_point(rows, len(names), fix_rounds)
+        point = resume_point(rows, self.phases, fix_rounds)
         if point is None:
             sys.exit(f"{self.name}: all {len(names)} phases already done; nothing to resume")
         step, attempt = point
         upcoming = names[step - 1] + (f" fix {attempt}" if attempt else "")
         last = rows[-1]
         self.last_row = last
-        dump = self.dir / "dumps" / f"after_{last['trace']}.{'sql' if self.arm == 'postgres' else 'archive'}"
-        if not (self.dir / "repo.bundle").exists() or not dump.exists():
-            sys.exit(f"{self.name}: repo.bundle or {dump.name} missing; can't resume")
+        restored = self.restore(self.dir, last)
+        self.seeded_phases = set(done) | {p for ph in self.phases if ph["name"] in done for p in ph.get("seed_more", [])}
+        meta = json.loads((self.dir / "meta.json").read_text(encoding="utf-8"))
+        meta.setdefault("resumed", []).append({"at": dt.datetime.now(dt.timezone.utc).isoformat(),
+                                               "from": upcoming, "model": self.model,
+                                               "claude_code_version": self.sh("claude --version")})
+        (self.dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
+        print(f"[{self.name}] resumed after {last['trace']} ({restored} records restored); "
+              f"next: {upcoming}", flush=True)
+        return step, attempt
+
+    def restore(self, source: Path, last: dict[str, Any]) -> int:
+        """Start containers with the live app as it was after `last`, an attempt recorded in the run folder `source`:
+        its code (from repo.bundle), its database (from the dump) and its seed data. Returns the records restored."""
+        dump = source / "dumps" / f"after_{last['trace']}.{'sql' if self.arm == 'postgres' else 'archive'}"
+        if not (source / "repo.bundle").exists() or not dump.exists():
+            sys.exit(f"{self.name}: repo.bundle or {dump.name} missing in {source}; can't restore")
         self.start_containers()
 
         def fail(message: str) -> None:
@@ -211,12 +254,16 @@ class Run:
             sys.exit(f"{self.name}: {message}")
 
         # The code exactly as deployed after the last attempt, with its git history but no trace of the bundle.
-        self.dc("cp", str(self.dir / "repo.bundle"), "workspace:/tmp/repo.bundle")
+        self.dc("cp", str(source / "repo.bundle"), "workspace:/tmp/repo.bundle")
         self.dc("exec", "-T", "-u", "root", "workspace", "chown", "dev:dev", "/tmp/repo.bundle")
         self.sh(f"git clone -q /tmp/repo.bundle . && git reset -q --hard {last['commit']} "
                 "&& git remote remove origin && rm /tmp/repo.bundle")
         if self.sh("git rev-parse HEAD") != last["commit"]:
             fail(f"could not restore commit {last['commit']}")
+        if (source / EXTRA).exists():
+            self.dc("cp", str(source / EXTRA), "workspace:/tmp/extra.tgz")
+            self.dc("exec", "-T", "-u", "root", "workspace", "chown", "dev:dev", "/tmp/extra.tgz")
+            self.sh("tar -xzf /tmp/extra.tgz && rm /tmp/extra.tgz")
         # Dependencies are not in git; the agent had them installed (including dev ones) before.
         self.sh("if [ -f package-lock.json ]; then npm ci --no-audit --no-fund; "
                 "elif [ -f package.json ]; then npm install --no-audit --no-fund; fi > /tmp/restore.log 2>&1")
@@ -229,19 +276,12 @@ class Run:
         restored, recorded = self.db_snapshot("resume")["records"], last["db"]["records"]
         if restored != recorded:
             fail(f"restored {restored} records, but {recorded} were recorded after {last['trace']}")
-        self.seed_data = json.loads((self.dir / "seed.json").read_text(encoding="utf-8"))
-        self.seeded_phases = set(done)
+        self.seed_data = json.loads((source / "seed.json").read_text(encoding="utf-8"))
         self.prev = last["commit"]
-        meta = json.loads((self.dir / "meta.json").read_text(encoding="utf-8"))
-        meta.setdefault("resumed", []).append({"at": dt.datetime.now(dt.timezone.utc).isoformat(),
-                                               "from": upcoming, "model": self.model,
-                                               "claude_code_version": self.sh("claude --version")})
-        (self.dir / "meta.json").write_text(json.dumps(meta, indent=2), encoding="utf-8")
-        print(f"[{self.name}] resumed after {last['trace']} ({restored} records restored); "
-              f"next: {upcoming}", flush=True)
-        return step, attempt
+        return restored
 
-    def run_agent(self, phase: str, prompt: str) -> tuple[bool, float]:
+    def run_agent(self, phase: str, prompt: str, budget: int = 1) -> tuple[bool, float]:
+        """One fresh agent session; budget multiplies the per-phase turn and time limits."""
         self.dc("restart", "workspace")
         # A fresh maintainer each phase: no transcripts or todos from earlier sessions.
         self.sh("rm -rf ~/.claude/projects ~/.claude/todos ~/.claude/shell-snapshots ~/.claude/CLAUDE.md")
@@ -250,12 +290,14 @@ class Run:
         with open(trace, "w", encoding="utf-8") as out, \
                 open(self.dir / "traces" / f"{phase}.stderr.txt", "w", encoding="utf-8") as err:
             try:
+                # The prompt goes in on stdin: a whole merged spec is too long for a Windows command line.
                 subprocess.run(
-                    self.compose + ["exec", "-T", "workspace", "claude", "-p", prompt,
+                    self.compose + ["exec", "-T", "workspace", "claude", "-p",
                                     "--output-format", "stream-json", "--verbose",
                                     "--model", self.model, "--dangerously-skip-permissions",
-                                    "--max-turns", str(self.max_turns)],
-                    env=self.env, stdin=subprocess.DEVNULL, stdout=out, stderr=err, timeout=self.timeout_s)
+                                    "--max-turns", str(self.max_turns * budget)],
+                    env=self.env, input=prompt.encode("utf-8"), stdout=out, stderr=err,
+                    timeout=self.timeout_s * budget)
             except subprocess.TimeoutExpired:
                 timed_out = True
         # Kills the agent if it timed out, and any servers it left running.
@@ -363,6 +405,17 @@ class Run:
     def export_repo(self) -> None:
         self.sh("git bundle create /tmp/repo.bundle --all")
         self.dc("cp", "workspace:/tmp/repo.bundle", str(self.dir / "repo.bundle"))
+        # Files git ignores that the app may still need (e.g. a vendored package's dist/, matched by the
+        # .gitignore's dist/); dependency folders are left out, a restore reinstalls those.
+        extra = self.dir / EXTRA
+        count = self.sh("git ls-files -z --others --ignored --exclude-standard --directory "
+                        f"| grep -zv -E '{DEPENDENCY_DIRS}' > /tmp/extra.lst; "
+                        "if [ -s /tmp/extra.lst ]; then tar --null -czf /tmp/extra.tgz -T /tmp/extra.lst "
+                        "&& tar -tzf /tmp/extra.tgz | wc -l; else echo 0; fi")
+        if count.isdigit() and int(count):
+            self.dc("cp", "workspace:/tmp/extra.tgz", str(extra))
+        elif extra.exists():
+            extra.unlink()
 
     def collect_coverage(self, a: str, b: str) -> dict[str, Any] | None:
         """Which of the lines added between commits a and b ran while the checks ran (call right after them)."""
@@ -395,7 +448,7 @@ class Run:
         assert row is not None
         constraints = prompts / "constraints.md"
         for k in range(max(start, 1), fix_rounds + 1):
-            if row["app_started"] and row["checks_passed"] == row["checks_total"]:
+            if row["app_started"] and (ph.get("fix") == "startup" or row["checks_passed"] == row["checks_total"]):
                 break
             report = self.bug_report(row)
             if constraints.exists():
@@ -424,14 +477,28 @@ class Run:
         return ("# Bug report\n\nAfter the last deploy, QA found these problems. Please fix them.\n\n"
                 + "\n".join(items[:20]) + more)
 
+    def seed_more(self, phase: str, row: dict[str, Any]) -> None:
+        """Production keeps growing: data the scenario adds once, after the phase's first successful deploy."""
+        if phase in self.seeded_phases or not hasattr(self.sc, "seed_more"):
+            return
+        self.seeded_phases.add(phase)
+        added = self.sc.seed_more(phase, self.base_url, self.seed_data)
+        if added:
+            self.seed_data.update(added)
+            (self.dir / "seed.json").write_text(json.dumps(self.seed_data, indent=1, ensure_ascii=False),
+                                                encoding="utf-8")
+            row.setdefault("seed", {}).update({key: len(v) for v_all in added.values() for key, v in v_all.items()
+                                               if isinstance(v, (list, dict))})
+
     def attempt(self, ph: dict[str, Any], step: int, k: int, prompt: str) -> dict[str, Any]:
         """One agent session (the feature itself, or fix round k), then deploy, check and record."""
         name = ph["name"]
         label = name if k == 0 else f"{name}_fix{k}"
-        timed_out, wall = self.run_agent(label, prompt)
+        timed_out, wall = self.run_agent(label, prompt, ph.get("budget", 1) if k == 0 else 1)
         sha = self.commit(ph["deploy"] if k == 0 else f"{ph['deploy']} hotfix {k}")
-        row: dict[str, Any] = {"scenario": self.scenario, "arm": self.arm, "repetition": self.rep,
+        row: dict[str, Any] = {"scenario": self.scenario, "arm": self.arm, "repetition": self.rep, "mode": self.mode,
                                "model": self.model, "phase": name, "kind": ph.get("kind", "feature"),
+                               **({"probe": ph["probe"]} if ph.get("probe") else {}),
                                "attempt": k, "trace": label,
                                "commit": sha, "timed_out": timed_out, "wall_s": round(wall),
                                **trace_metrics(self.dir / "traces" / f"{label}.jsonl"),
@@ -440,26 +507,24 @@ class Run:
         row["app_started"] = self.start_app()
         results: dict[str, Any] = {}
         if row["app_started"]:
-            if step == 1 and self.seed_data is None:
+            seeded_now = step == 1 and self.seed_data is None
+            if seeded_now:
                 self.seed_data = self.sc.seed_data(self.base_url)
                 (self.dir / "seed.json").write_text(json.dumps(self.seed_data, indent=1, ensure_ascii=False),
                                                     encoding="utf-8")
                 row["seed"] = {key: len(v) for key, v in self.seed_data.items() if isinstance(v, (list, dict))}
-            elif self.seed_data is not None and name not in self.seeded_phases and hasattr(self.sc, "seed_more"):
-                # Production keeps growing: data added once, after this phase's first successful deploy.
-                self.seeded_phases.add(name)
-                added = self.sc.seed_more(name, self.base_url, self.seed_data)
-                if added:
-                    self.seed_data.update(added)
-                    (self.dir / "seed.json").write_text(json.dumps(self.seed_data, indent=1, ensure_ascii=False),
-                                                        encoding="utf-8")
-                    row["seed"] = {key: len(v) for v_all in added.values() for key, v in v_all.items()
-                                   if isinstance(v, (list, dict))}
-            results = self.sc.run_checks(name, self.base_url, self.seed_data)
+            # A merged run's first step adds, right after the seed, what the phases add over time.
+            if self.seed_data is not None and (self.mode == "merged" or not seeded_now):
+                for phase in ph.get("seed_more", [name]):
+                    self.seed_more(phase, row)
+            results = self.sc.run_checks(ph.get("checks", name), self.base_url, self.seed_data)
+            if ph.get("probe"):
+                results.update(self.sc.probe_checks(ph["probe"], self.base_url, self.seed_data))
             row["coverage"] = self.collect_coverage(self.prev, sha)
         (self.dir / f"app_{label}.log").write_text(self.sh("tail -c 200000 /tmp/app.log"), encoding="utf-8")
         if row["app_started"]:
-            results.update(self.sc.after_checks(self, name))
+            for phase in ph.get("after_checks", [name]):
+                results.update(self.sc.after_checks(self, phase))
         self.sh(f"rm -rf {coverage.COVERAGE_DIR} {coverage.PRELOAD} {coverage.FLUSH}")
         row["checks"] = results
         row["checks_passed"] = sum(r["pass"] for r in results.values())
@@ -474,7 +539,7 @@ class Run:
         with open(self.dir / "metrics.jsonl", "a", encoding="utf-8") as f:
             f.write(json.dumps(row, ensure_ascii=False) + "\n")
         self.prev = sha
-        print(f"[{self.name}] {step}/{len(self.sc.PHASES)} {name}{f' fix {k}' if k else ''}: status={row['status']} "
+        print(f"[{self.name}] {step}/{len(self.phases)} {name}{f' fix {k}' if k else ''}: status={row['status']} "
               f"cost=${round(row['cost_usd'] or 0, 2)} turns={row['turns']} files={row['files_touched']} "
               f"checks={row['checks_passed']}/{row['checks_total']}", flush=True)
         return row
@@ -488,8 +553,13 @@ def main() -> None:
                    help="which repeat of this setup (1-99); separates runs with identical settings")
     p.add_argument("--model", default=os.environ.get("CLAUDE_MODEL"),
                    help="pinned model id passed to claude --model (default: CLAUDE_MODEL from .env)")
-    p.add_argument("--max-turns", type=int, default=200, help="per-phase turn budget")
-    p.add_argument("--timeout-min", type=int, default=180, help="per-phase wall-clock limit")
+    p.add_argument("--max-turns", type=int, default=200,
+                   help="per-phase turn budget (a merged run's build session gets this times the number of phases)")
+    p.add_argument("--timeout-min", type=int, default=180,
+                   help="per-phase wall-clock limit (a merged run's build session: this times the number of phases)")
+    p.add_argument("--mode", choices=["incremental", "merged"], default="incremental",
+                   help="incremental: one change request per phase (default); merged: the whole spec at once, "
+                        "then the data changes, then every check (scenario.toml [[merged]]; results in <db>_merged_rep<N>)")
     p.add_argument("--fix-rounds", type=int, default=2,
                    help="after a phase with failing checks, give a fresh agent a bug report up to this many times (0 = off)")
     p.add_argument("--keep", action="store_true",
@@ -501,19 +571,24 @@ def main() -> None:
     a = p.parse_args()
     if not 1 <= a.repetition <= 99:
         sys.exit("--repetition must be between 1 and 99")
+    if a.mode == "merged" and a.repetition > 49:
+        sys.exit("merged runs take --repetition 1-49 (they use the upper half of the port range)")
+    if a.mode == "merged" and not load_scenario(a.scenario).MERGED:
+        sys.exit(f"scenario {a.scenario} has no [[merged]] steps in its scenario.toml")
     if not (os.environ.get("ANTHROPIC_FOUNDRY_API_KEY") or os.environ.get("ANTHROPIC_API_KEY")):
-        sys.exit("No API key: set ANTHROPIC_FOUNDRY_API_KEY (Grove) or ANTHROPIC_API_KEY in .env")
+        sys.exit("No API key: set AI_GATEWAY_API_KEY (AI gateway), ANTHROPIC_FOUNDRY_API_KEY (Grove) "
+                 "or ANTHROPIC_API_KEY in .env")
     if not a.model:
         sys.exit("No model: set CLAUDE_MODEL in .env or pass --model")
 
-    run = Run(a.scenario, a.db, a.repetition, a.model, a.max_turns, a.timeout_min * 60)
+    run = Run(a.scenario, a.db, a.repetition, a.model, a.max_turns, a.timeout_min * 60, a.mode)
     if a.resume and a.overwrite:
         sys.exit("use either --resume or --overwrite, not both")
     done = phases_done(run.dir)
     if a.resume and not done:
         sys.exit(f"{run.dir} has no results to resume")
     if done and not (a.resume or a.overwrite):
-        status = f"{run.dir} already has results ({len(done)}/{len(run.sc.PHASES)} phases done)"
+        status = f"{run.dir} already has results ({len(done)}/{len(run.phases)} phases done)"
         if not sys.stdin.isatty():
             sys.exit(f"{status}; pass --resume or --overwrite")
         choice = input(f"{status}. [r]esume, [o]verwrite, or [c]ancel? ").strip().lower()[:1]
@@ -524,7 +599,7 @@ def main() -> None:
         clear_results(run.dir)
     first, first_attempt = run.resume(a.fix_rounds) if a.resume else (run.setup() or 1, 0)
     try:
-        for step, ph in enumerate(run.sc.PHASES, start=1):
+        for step, ph in enumerate(run.phases, start=1):
             if step == first and first_attempt:
                 run.phase(ph, step, a.fix_rounds, start=first_attempt, row=run.last_row)
             elif step >= first:

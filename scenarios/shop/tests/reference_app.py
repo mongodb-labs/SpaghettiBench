@@ -12,6 +12,8 @@ Deliberately wrong modes, to show the checks catch them:
 - `lazy_expiry`: expired carts keep holding stock until a cleanup removes them, up to a minute later
   (relying on a TTL index for correctness).
 - `unversioned_edits`: order edits ignore `version`, so concurrent edits overwrite each other.
+- `live_tax_rates` (the `vat` probe): orders show tax at the shop's current rates instead of those in force when
+  the order was placed.
 """
 from __future__ import annotations
 
@@ -158,7 +160,8 @@ def same_value(stored: Any, want: Any) -> bool:
 
 
 class State:
-    def __init__(self, live_prices: bool, racy_stock: bool, lazy_expiry: bool, unversioned_edits: bool):
+    def __init__(self, live_prices: bool, racy_stock: bool, lazy_expiry: bool, unversioned_edits: bool,
+                 live_tax_rates: bool = False):
         self.products: dict[str, dict] = {}
         self.variant_product: dict[str, str] = {}
         self.orders: dict[str, dict] = {}
@@ -174,16 +177,61 @@ class State:
         self.pickups: dict[str, dict] = {}
         self.subscriptions: dict[str, dict] = {}
         self.movements: list[dict] = []
+        self.tax: dict[str, dict] = {}
         self.seq = 0
         self.lock = threading.RLock()
         self.live = live_prices
         self.racy = racy_stock
         self.lazy = lazy_expiry
         self.unversioned = unversioned_edits
+        self.live_tax = live_tax_rates
 
     def next_seq(self) -> int:
         self.seq += 1
         return self.seq
+
+    # ------------------------------------------------------------ VAT (the `vat` probe)
+
+    def tax_settings(self, shop: str) -> dict:
+        return self.tax.get(shop, {"standardRate": Decimal(0), "categoryRates": {}})
+
+    def rate_for(self, shop: str, category: str) -> Decimal:
+        t = self.tax_settings(shop)
+        return t["categoryRates"].get(category, t["standardRate"])
+
+    @staticmethod
+    def tax_in(paid: int, rate: Decimal) -> int:
+        """The tax included in a tax-inclusive amount, in cents."""
+        return round_cents(Decimal(paid) * rate / (100 + rate))
+
+    @staticmethod
+    def valid_rate(v: Any) -> bool:
+        return is_num(v) and 0 <= v <= 100 and (Decimal(str(v)) * 100) % 1 == 0
+
+    def set_tax(self, shop: str, b: dict) -> dict:
+        rates = b.get("categoryRates", {})
+        if (not self.valid_rate(b.get("standardRate")) or not isinstance(rates, dict)
+                or not all(text(k) and self.valid_rate(v) for k, v in rates.items())):
+            raise Invalid()
+        self.tax[shop] = {"standardRate": Decimal(str(b["standardRate"])),
+                          "categoryRates": {k: Decimal(str(v)) for k, v in rates.items()}}
+        return self.tax_view(shop)
+
+    def tax_view(self, shop: str) -> dict:
+        rate = lambda d: int(d) if d == d.to_integral_value() else float(d)
+        t = self.tax_settings(shop)
+        return {"standardRate": rate(t["standardRate"]), "categoryRates": {k: rate(v) for k, v in t["categoryRates"].items()}}
+
+    def line_rate(self, o: dict, l: dict) -> Decimal:
+        p = self.products.get(l["productId"])
+        return self.rate_for(o["shopId"], p["category"]) if self.live_tax and p else l["taxRate"]
+
+    def line_tax(self, o: dict, l: dict) -> int:
+        return self.tax_in(l["lineTotal"] - l["discount"], self.line_rate(o, l))
+
+    def shipping_tax(self, o: dict) -> int:
+        rate = self.tax_settings(o["shopId"])["standardRate"] if self.live_tax else o["shippingTaxRate"]
+        return self.tax_in(o["shippingFee"], rate)
 
     # ------------------------------------------------------------ stock
 
@@ -689,7 +737,8 @@ class State:
         return {"id": uuid.uuid4().hex, "productId": p["id"], "variantId": v["id"], "sku": v["sku"], "name": name,
                 "options": {k: translated.get(x, x) for k, x in v["options"].items()}, "unitPrice": v["price"],
                 "quantity": q, "lineTotal": v["price"] * q, "personalization": values, "discount": 0,
-                "returnedQuantity": 0, "refunded": 0}
+                "returnedQuantity": 0, "refunded": 0, "taxRate": self.rate_for(p["shopId"], p["category"]),
+                "taxRefunded": 0}
 
     def commit_order(self, plan: dict) -> dict:
         oid = uuid.uuid4().hex
@@ -705,7 +754,8 @@ class State:
              "status": "placed", "createdAt": now(), "lines": lines, "subtotal": subtotal,
              "discount": {"code": plan["code"]["code"], "amount": amount} if plan["code"] else None, "refunded": 0,
              "version": 1, "revisions": [], "delivery": plan["delivery"], "shippingFee": plan["fee"],
-             "subscriptionId": plan["subscriptionId"], "lang": plan["lang"]}
+             "subscriptionId": plan["subscriptionId"], "lang": plan["lang"],
+             "shippingTaxRate": self.tax_settings(shop)["standardRate"]}
         self.orders[o["id"]] = o
         return self.order_view(o)
 
@@ -731,14 +781,20 @@ class State:
                           "name": name, "options": dict(l["options"]), "unitPrice": money(price),
                           "quantity": l["quantity"], "lineTotal": money(l["lineTotal"]),
                           "personalization": dict(l["personalization"]), "discount": money(l["discount"]),
-                          "returnedQuantity": l["returnedQuantity"]})
+                          "returnedQuantity": l["returnedQuantity"],
+                          "taxRate": self.tax_view_rate(self.line_rate(o, l)), "tax": money(self.line_tax(o, l))})
         amount = o["discount"]["amount"] if o["discount"] else 0
+        tax = sum(self.line_tax(o, l) for l in o["lines"]) + self.shipping_tax(o)
         return {"id": o["id"], "shopId": o["shopId"], "number": o["number"], "customerEmail": o["customerEmail"],
                 "status": o["status"], "createdAt": o["createdAt"], "items": items, "subtotal": money(o["subtotal"]),
                 "discount": {"code": o["discount"]["code"], "amount": money(amount)} if o["discount"] else None,
                 "total": money(o["subtotal"] - amount + o["shippingFee"]), "refunded": money(o["refunded"]),
                 "version": o["version"], "delivery": copy.deepcopy(o["delivery"]), "shippingFee": money(o["shippingFee"]),
-                "subscriptionId": o["subscriptionId"]}
+                "subscriptionId": o["subscriptionId"], "shippingTax": money(self.shipping_tax(o)), "tax": money(tax)}
+
+    @staticmethod
+    def tax_view_rate(d: Decimal) -> int | float:
+        return int(d) if d == d.to_integral_value() else float(d)
 
     def changing(self, o: dict) -> None:
         """Keep the order as it is now as a revision, before a change."""
@@ -809,25 +865,29 @@ class State:
             paid = line["lineTotal"] - line["discount"]
             if line["returnedQuantity"] + q == line["quantity"]:
                 refund = paid - line["refunded"]
+                tax = self.line_tax(o, line) - line["taxRefunded"]
             else:
                 refund = round_cents(Decimal(paid) * q / line["quantity"])
+                tax = self.tax_in(refund, self.line_rate(o, line))
             line["returnedQuantity"] += q
             line["refunded"] += refund
+            line["taxRefunded"] += tax
             self.variant(line["variantId"])["stock"] += q
             self.move(line["variantId"], q, "return", o["id"])
-            out.append({"lineId": line["id"], "quantity": q, "refund": refund})
+            out.append({"lineId": line["id"], "quantity": q, "refund": refund, "tax": tax})
         total = sum(x["refund"] for x in out)
         o["refunded"] += total
         o["status"] = "returned" if all(l["returnedQuantity"] == l["quantity"] for l in o["lines"]) \
             else "partially_returned"
         r = {"id": uuid.uuid4().hex, "orderId": o["id"], "createdAt": now(), "reason": reason, "items": out,
-             "refund": total}
+             "refund": total, "tax": sum(x["tax"] for x in out)}
         self.returns.setdefault(o["id"], []).append(r)
         return self.return_view(r)
 
     @staticmethod
     def return_view(r: dict) -> dict:
-        return {**r, "items": [{**x, "refund": money(x["refund"])} for x in r["items"]], "refund": money(r["refund"])}
+        return {**r, "items": [{**x, "refund": money(x["refund"]), "tax": money(x["tax"])} for x in r["items"]],
+                "refund": money(r["refund"]), "tax": money(r["tax"])}
 
     # ------------------------------------------------------------ reviews
 
@@ -1222,15 +1282,18 @@ class State:
                          "discountCode": o["discount"]["code"] if o["discount"] else None}
                 key = tuple(known[k] if k in known else l["options"].get(k[7:]) if k.startswith("option.")
                             else (p["attributes"].get(k[5:]) if p else None) for k in group_by)
-                g = groups.setdefault(key, {"orders": set(), "units": 0, "gross": 0, "discounts": 0, "refunds": 0})
+                g = groups.setdefault(key, {"orders": set(), "units": 0, "gross": 0, "discounts": 0, "refunds": 0,
+                                            "tax": 0})
                 g["orders"].add(o["id"])
                 g["units"] += l["quantity"] - l["returnedQuantity"]
                 g["gross"] += l["lineTotal"]
                 g["discounts"] += l["discount"]
                 g["refunds"] += l["refunded"]
+                g["tax"] += self.line_tax(o, l) - l["taxRefunded"]
         return {"groups": [{**dict(zip(group_by, key)), "orders": len(g["orders"]), "units": g["units"],
                             "gross": money(g["gross"]), "discounts": money(g["discounts"]),
-                            "refunds": money(g["refunds"]), "net": money(g["gross"] - g["discounts"] - g["refunds"])}
+                            "refunds": money(g["refunds"]), "net": money(g["gross"] - g["discounts"] - g["refunds"]),
+                            "tax": money(g["tax"])}
                            for key, g in groups.items()]}
 
 
@@ -1406,6 +1469,10 @@ class Handler(BaseHTTPRequestHandler):
                 return 200, st.settings[shop]
             case "GET", ["shops", shop, "settings"]:
                 return 200, {"cartHoldSeconds": st.hold_seconds(shop)}
+            case "PUT", ["shops", shop, "tax"]:
+                return 200, st.set_tax(shop, b)
+            case "GET", ["shops", shop, "tax"]:
+                return 200, st.tax_view(shop)
             case "POST", ["carts"]:
                 return 201, st.cart_view(st.new_cart(b))
             case "GET", ["carts", cid]:
@@ -1461,8 +1528,8 @@ class Handler(BaseHTTPRequestHandler):
 
 
 def serve(live_prices: bool = False, racy_stock: bool = False, lazy_expiry: bool = False,
-          unversioned_edits: bool = False) -> tuple[ThreadingHTTPServer, str]:
+          unversioned_edits: bool = False, live_tax_rates: bool = False) -> tuple[ThreadingHTTPServer, str]:
     srv = ThreadingHTTPServer(("127.0.0.1", 0), Handler)
-    srv.state = State(live_prices, racy_stock, lazy_expiry, unversioned_edits)  # type: ignore[attr-defined]
+    srv.state = State(live_prices, racy_stock, lazy_expiry, unversioned_edits, live_tax_rates)  # type: ignore[attr-defined]
     threading.Thread(target=srv.serve_forever, daemon=True).start()
     return srv, f"http://127.0.0.1:{srv.server_address[1]}"
